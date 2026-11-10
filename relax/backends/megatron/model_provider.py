@@ -407,6 +407,8 @@ def get_model_provider_func(
             "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
@@ -601,6 +603,14 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            if getattr(args, "moe_megakernel_backend", None) == "mok":
+                layers = [
+                    (name, layer) for name, layer in model.named_modules() if hasattr(layer, "megakernel_experts")
+                ]
+                for name, layer in layers:
+                    if type(layer.megakernel_experts).__name__ != "MoKMegakernel":
+                        raise RuntimeError(f"Requested MoK but {name} did not construct MoKMegakernel")
+                logger.info("MOK_BACKEND_PROVENANCE layers=%s names=%s", len(layers), [name for name, _ in layers])
             configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)

@@ -790,3 +790,32 @@ def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
     module.get_model_provider_func(_bridge_args(**policy), role="actor")
     assert provider.finalized
     assert {name: getattr(provider, name) for name in policy} == policy
+
+
+@pytest.mark.parametrize("backend,config", [(None, None), ("mok", {"token_capacity": 65536})])
+def test_bridge_provider_forwards_megakernel_before_finalize(monkeypatch, backend, config):
+    provider = _FakeProvider()
+    provider.moe_megakernel_backend = None
+    provider.moe_megakernel_backend_config = None
+    module, provider = _load_model_provider(monkeypatch, provider)
+
+    def finalize():
+        assert provider.moe_megakernel_backend == backend
+        assert provider.moe_megakernel_backend_config == config
+        provider.finalized = True
+
+    provider.finalize = finalize
+    module.get_model_provider_func(_bridge_args(moe_megakernel_backend=backend, moe_megakernel_backend_config=config))
+    assert provider.finalized
+
+
+def test_bridge_provider_rejects_wrong_requested_mok_backend(monkeypatch):
+    model = torch.nn.Module()
+    model.megakernel_experts = torch.nn.Linear(1, 1)
+    provider = _FakeProvider(model)
+    provider.moe_megakernel_backend = None
+    provider.moe_megakernel_backend_config = None
+    module, _ = _load_model_provider(monkeypatch, provider)
+    provide = module.get_model_provider_func(_bridge_args(moe_megakernel_backend="mok"))
+    with pytest.raises(RuntimeError, match="did not construct MoKMegakernel"):
+        provide(pre_process=True, post_process=True)

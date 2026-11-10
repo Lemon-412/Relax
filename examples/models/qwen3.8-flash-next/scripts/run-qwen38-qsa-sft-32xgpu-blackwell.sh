@@ -51,7 +51,7 @@ ENV_ARGS=(
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
     NCCL_NVLS_ENABLE=0
-    "PYTHONPATH=${RELAX}:${MEGATRON}"
+    "PYTHONPATH=${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
     "MEGATRON=${MEGATRON}"
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
@@ -231,10 +231,12 @@ MISC_ARGS=(
     --moe-flex-dispatcher-num-sms 80
     # Keep the default balanced packing used by this baseline.
     --moe-hybridep-pad-variable-tokens
-    --moe-shared-expert-overlap
     --overlap-grad-reduce
     --overlap-param-gather
 )
+if [[ "${QWEN38_SHARED_EXPERT_OVERLAP:-1}" == 1 ]]; then
+    MISC_ARGS+=(--moe-shared-expert-overlap)
+fi
 if [[ "${QWEN38_SFT_HEALTH_CHECK:-1}" == 1 ]]; then
     MISC_ARGS+=(--use-health-check)
 fi

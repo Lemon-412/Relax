@@ -1,0 +1,165 @@
+--- a/megatron/core/transformer/moe/moe_layer.py
++++ b/megatron/core/transformer/moe/moe_layer.py
+@@ -383,12 +383,17 @@
+             name=(name + ".experts") if name is not None else None,
+         )
+ 
++        # TP shared experts retain their native sequence-parallel implementation.
++        self.megakernel_fuses_shared_expert = (
++            self.config.moe_megakernel_backend is not None
++            and self.config.tensor_model_parallel_size == 1
++        )
+         # Initialize shared experts
+         if self.use_shared_expert:
+             assert (
+                 self.submodules.shared_experts is not None
+             ), "Shared experts builder is not provided in the module spec."
+-            if self.config.moe_megakernel_backend is None:
++            if not self.megakernel_fuses_shared_expert:
+                 self.shared_experts = self.submodules.shared_experts(
+                     config=self.config,
+                     pg_collection=pg_collection,
+@@ -416,7 +421,7 @@
+                 config=self.config,
+                 ep_group=self.ep_group,
+                 routed_experts=self.experts,
+-                shared_experts=self.shared_experts,
++                shared_experts=self.shared_experts if self.megakernel_fuses_shared_expert else None,
+                 num_local_experts=self.num_local_experts,
+             )
+ 
+@@ -789,7 +794,7 @@
+             ):
+                 padding_mask = (
+                     tensor_parallel.scatter_to_sequence_parallel_region(
+-                        padding_mask.transpose(0, 1).contiguous()
++                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                     )
+                     .transpose(0, 1)
+                     .contiguous()
+@@ -811,10 +816,22 @@
+                 )
+ 
+             def megakernel_forward(hidden_states, padding_mask):
++                shared_output = None
++                if not self.megakernel_fuses_shared_expert:
++                    shared_output = self.shared_experts_compute(hidden_states)
++                local_input_ids = input_ids
++                if self.config.sequence_parallel:
++                    if local_input_ids is not None and local_input_ids.shape[1] != hidden_states.shape[0]:
++                        if local_input_ids.shape[1] != hidden_states.shape[0] * self.tp_group.size():
++                            raise ValueError("MoK input_ids do not match local or full SP sequence")
++                        local_input_ids = tensor_parallel.scatter_to_sequence_parallel_region(
++                            local_input_ids.transpose(0, 1).contiguous(), group=self.tp_group
++                        ).transpose(0, 1).contiguous()
+                 probs, routing_map = self.route(
+-                    hidden_states, padding_mask, input_ids, packed_seq_params
+-                )
+-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
++                    hidden_states, padding_mask, local_input_ids, packed_seq_params
++                )
++                output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
++                return output if shared_output is None else output + shared_output
+ 
+             if self.moe_layer_recompute and self.training:
+                 if self.config.fp8 or self.config.fp4:
+--- a/megatron/core/transformer/moe/megakernel/factory.py
++++ b/megatron/core/transformer/moe/megakernel/factory.py
+@@ -20,7 +20,7 @@
+     config: TransformerConfig,
+     ep_group: ProcessGroup,
+     routed_experts: nn.Module,
+-    shared_experts: nn.Module,
++    shared_experts: nn.Module | None,
+     num_local_experts: int,
+ ) -> MegakernelBackend:
+     """Build the configured megakernel backend.
+--- a/megatron/core/transformer/moe/megakernel/mok/backend.py
++++ b/megatron/core/transformer/moe/megakernel/mok/backend.py
+@@ -40,7 +40,7 @@
+         config: TransformerConfig,
+         ep_group: ProcessGroup,
+         routed_experts: nn.Module,
+-        shared_experts: nn.Module,
++        shared_experts: nn.Module | None,
+         num_local_experts: int,
+     ) -> None:
+         super().__init__()
+@@ -181,8 +181,8 @@
+ 
+     def main_grad_arguments(self):
+         """Return MOK logical main grads and optional per-expert descriptors."""
+-        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
+-        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
++        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight) if self.shared_fc1_weight is not None else None
++        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight) if self.shared_fc2_weight is not None else None
+         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
+         fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
+         main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
+@@ -211,6 +211,11 @@
+     @torch.no_grad()
+     def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
+         """Validate and alias MCore-owned native BF16 shared weights."""
++        if shared is None:
++            self.register_parameter("shared_fc1_weight", None)
++            self.register_parameter("shared_fc2_weight", None)
++            self.register_parameter("shared_output_gate_weight", None)
++            return
+         fc1_ref = shared.linear_fc1.weight
+         fc2_ref = shared.linear_fc2.weight
+         from megatron.core.fp8_utils import is_float8tensor
+--- a/megatron/core/transformer/moe/megakernel/mok/runtime.py
++++ b/megatron/core/transformer/moe/megakernel/mok/runtime.py
+@@ -18,7 +18,7 @@
+     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+ 
+ 
+-def _gate_up_weight_arguments(shared_fc1: torch.Tensor, routed_fc1, intermediate_size: int):
++def _gate_up_weight_arguments(shared_fc1: torch.Tensor | None, routed_fc1, intermediate_size: int):
+     """Adapt MCore-owned combined FC1 weights to MOK's gate/up API.
+ 
+     Shared FC1 is a dense two-dimensional parameter, so gate and up are
+@@ -27,6 +27,8 @@
+     and up preserves its storage metadata, and MOK applies the existing logical
+     gate/up offsets when the two arguments alias.
+     """
++    if shared_fc1 is None:
++        return None, None, routed_fc1, routed_fc1
+     expected_rows = 2 * intermediate_size
+     if shared_fc1.ndim != 2 or shared_fc1.shape[0] != expected_rows:
+         raise RuntimeError(
+@@ -62,7 +64,7 @@
+         router_weights: torch.Tensor,
+         top_experts: torch.Tensor,
+         shared_output_gate_weight: torch.Tensor | None,
+-        *parameters: torch.Tensor,
++        *parameters: torch.Tensor | None,
+     ) -> torch.Tensor:
+         """Run MOK forward and retain the state needed by backward."""
+         from mok import functional
+@@ -181,8 +183,8 @@
+         )
+ 
+         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
+-        d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
+-        d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
++        d_shared_fc1 = (_finish_weight_gradient(ctx.module.shared_fc1_weight) if ctx.module.shared_fc1_weight is not None else None)
++        d_shared_fc2 = (_finish_weight_gradient(ctx.module.shared_fc2_weight) if ctx.module.shared_fc2_weight is not None else None)
+         d_output_gate = (
+             _finish_weight_gradient(ctx.module.shared_output_gate_weight)
+             if shared_output_gate_weight is not None
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -2479,8 +2479,10 @@
+                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
+                     "the megakernel never runs the native dispatch path"
+                 )
+-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
++            if self.expert_tensor_parallel_size != 1:
++                raise ValueError("MOK requires expert TP=1")
++            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
++                raise ValueError("MOK with TP>1 requires sequence_parallel=True")
+             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
+                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
+             if self.moe_shared_expert_intermediate_size is None:

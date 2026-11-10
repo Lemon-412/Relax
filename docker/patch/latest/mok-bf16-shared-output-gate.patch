@@ -1,0 +1,208 @@
+--- a/megatron/core/transformer/moe/megakernel/mok/runtime.py
++++ b/megatron/core/transformer/moe/megakernel/mok/runtime.py
+@@ -9,6 +9,9 @@
+
+ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
+     finish_weight_gradient as _finish_weight_gradient,
++)
++from megatron.core.transformer.moe.megakernel.parameter_bridge import (
++    main_grad_buffer as _main_grad_buffer,
+ )
+
+ if TYPE_CHECKING:
+@@ -58,6 +61,7 @@
+         x: torch.Tensor,
+         router_weights: torch.Tensor,
+         top_experts: torch.Tensor,
++        shared_output_gate_weight: torch.Tensor | None,
+         *parameters: torch.Tensor,
+     ) -> torch.Tensor:
+         """Run MOK forward and retain the state needed by backward."""
+@@ -95,6 +99,9 @@
+         shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
+             shared_fc1, fc1_forward, module.intermediate_size
+         )
++        gate_kwargs = {}
++        if shared_output_gate_weight is not None:
++            gate_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
+         output, forward_context = functional.forward(
+             module.mok_config,
+             workspace,
+@@ -108,6 +115,7 @@
+             routed_up,
+             fc2_forward,
+             swiglu_limit=module.swiglu_limit,
++            **gate_kwargs,
+         )
+
+         ctx.module = module
+@@ -115,7 +123,9 @@
+         ctx.schedule = schedule
+         ctx.forward_context = forward_context
+         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
+-        ctx.save_for_backward(x, router_weights, *routed_parameters, shared_fc1, shared_fc2)
++        ctx.save_for_backward(
++            x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
++        )
+         return output
+
+     @staticmethod
+@@ -123,7 +133,7 @@
+         """Run MOK backward and return gradients for its autograd inputs."""
+         from mok import functional
+
+-        x, router_weights, *parameters = ctx.saved_tensors
++        x, router_weights, shared_output_gate_weight, *parameters = ctx.saved_tensors
+         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
+         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
+         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
+@@ -142,6 +152,14 @@
+         main_grads, main_grad_storage_tables = _gate_up_main_grad_arguments(
+             main_grads, main_grad_storage_tables, ctx.module.intermediate_size
+         )
++        gate_kwargs = {}
++        if shared_output_gate_weight is not None:
++            gate_kwargs = {
++                "shared_output_gate_weight": shared_output_gate_weight,
++                "shared_output_gate_main_grad": _main_grad_buffer(
++                    ctx.module.shared_output_gate_weight
++                ),
++            }
+         d_x, d_router_weights, *_ = functional.backward(
+             ctx.module.mok_config,
+             ctx.workspace,
+@@ -159,11 +177,17 @@
+             swiglu_limit=ctx.module.swiglu_limit,
+             main_grads=main_grads,
+             main_grad_storage_tables=main_grad_storage_tables,
++            **gate_kwargs,
+         )
+
+         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
+         d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
+         d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
++        d_output_gate = (
++            _finish_weight_gradient(ctx.module.shared_output_gate_weight)
++            if shared_output_gate_weight is not None
++            else None
++        )
+
+         ctx.module = None
+         ctx.workspace = None
+@@ -175,6 +199,7 @@
+             d_x,
+             d_router_weights,
+             None,
++            d_output_gate,
+             *routed_parameter_grads,
+             d_shared_fc1,
+             d_shared_fc2,
+--- a/megatron/core/transformer/moe/megakernel/mok/backend.py
++++ b/megatron/core/transformer/moe/megakernel/mok/backend.py
+@@ -67,8 +67,6 @@
+                 "MOK supports at most moe_router_topk logical routes per token; "
+                 "use MOK internal expert padding instead of moe_pad_expert_input_to_capacity"
+             )
+-        if config.moe_shared_expert_gate:
+-            raise ValueError("MOK does not support MCore's optional shared-expert output gate")
+
+         self.ep_group = ep_group
+         self.num_local_experts = num_local_experts
+@@ -97,8 +95,16 @@
+                     "but MOK bypasses that forward path."
+                 )
+         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
++        options = dict(config.moe_megakernel_backend_config or {})
++        # Caller supplies one identical physical capacity on every EP rank.
++        # Keep workspace keys stable across variable-length microbatches.
++        self.token_capacity = options.pop("token_capacity", None)
++        if self.token_capacity is not None and (
++            type(self.token_capacity) is not int or self.token_capacity < 512
++        ):
++            raise ValueError("MOK token_capacity must be an integer >= 512")
+         try:
+-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
++            self.mok_config = MoKConfig(**options)
+         except TypeError as exc:
+             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
+
+@@ -143,7 +149,7 @@
+             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
+             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
+
+-        self._register_shared_weights(shared_experts)
++        self._register_shared_weights(shared_experts, use_output_gate=config.moe_shared_expert_gate)
+
+         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
+         # once per optimizer iteration, matching TE's weight-cache lifecycle.
+@@ -203,7 +209,7 @@
+         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
+
+     @torch.no_grad()
+-    def _register_shared_weights(self, shared: nn.Module) -> None:
++    def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
+         """Validate and alias MCore-owned native BF16 shared weights."""
+         fc1_ref = shared.linear_fc1.weight
+         fc2_ref = shared.linear_fc2.weight
+@@ -234,6 +240,22 @@
+         # module remains registered and emits the canonical checkpoint entries.
+         self.register_parameter("shared_fc1_weight", fc1_ref)
+         self.register_parameter("shared_fc2_weight", fc2_ref)
++        output_gate = getattr(shared, "gate_weight", None) if use_output_gate else None
++        if use_output_gate and (
++            not isinstance(output_gate, nn.Parameter)
++            or is_float8tensor(output_gate)
++            or output_gate.dtype != torch.bfloat16
++            or tuple(output_gate.shape) != (1, h)
++            or not output_gate.is_contiguous()
++        ):
++            raise RuntimeError(
++                "MOK shared output gate must be a native contiguous BF16 Parameter "
++                "with shape [1, H]"
++            )
++        # Include the native gate in parameter-gather hooks without adding a
++        # second optimizer parameter or checkpoint entry.
++        self.register_parameter("shared_output_gate_weight", output_gate)
++
+
+     @torch.no_grad()
+     def quantized_routed_weights(self):
+@@ -320,13 +342,24 @@
+         # representation. Missing routes are encoded as expert -1 with zero weight.
+         router_weights, top_experts = routing_map_to_mok_inputs(probs, routing_map, self.topk)
+
++        real_tokens = x.shape[0]
++        if self.token_capacity is not None:
++            if real_tokens > self.token_capacity:
++                raise ValueError("MOK input exceeds the common EP token_capacity")
++            pad_rows = self.token_capacity - real_tokens
++            # Padding is outside routing/aux loss. No added row selects an expert.
++            x = torch.nn.functional.pad(x, (0, 0, 0, pad_rows))
++            router_weights = torch.nn.functional.pad(router_weights, (0, 0, 0, pad_rows))
++            top_experts = torch.nn.functional.pad(top_experts, (0, 0, 0, pad_rows), value=-1)
++
+         output = _MoKAutograd.apply(
+             self,
+             x,
+             router_weights,
+             top_experts,
++            self.shared_output_gate_weight,
+             *self.autograd_routed_parameters,
+             self.shared_fc1_weight,
+             self.shared_fc2_weight,
+         )
+-        return output.view(original_shape)
++        return output[:real_tokens].view(original_shape)
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -2485,8 +2485,8 @@
+                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
+             if self.moe_shared_expert_intermediate_size is None:
+                 raise ValueError("MOK requires a shared expert")
+-            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+-                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
++            if self.moe_shared_expert_overlap:
++                raise ValueError("MOK does not support MCore shared-expert overlap")
+             if self.moe_latent_size is not None:
+                 raise ValueError("MOK does not support latent MoE")
+             if self.recompute_modules and "shared_experts" in self.recompute_modules:

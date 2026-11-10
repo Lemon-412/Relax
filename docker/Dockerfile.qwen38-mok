@@ -1,0 +1,47 @@
+# Optional BF16 MoK environment for the validated Blackwell base image.
+# BASE_IMAGE: qs-20261101-bfdd68d7-pr529-cu13-blackwell (Python 3.12 / Torch cu130).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ARG MOK_COMMIT=ee7bdaba515fd3d557105d71809ec74cd523d5a1
+
+RUN python -m venv --system-site-packages /opt/relax/mok-env && \
+    BASE_SITE=$(python -c 'from pathlib import Path; import torch; print(Path(torch.__file__).resolve().parents[1])') && \
+    TARGET_SITE=$(/opt/relax/mok-env/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))') && \
+    printf 'import site; site.addsitedir("%s")\n' "$BASE_SITE" > "$TARGET_SITE/relax_base_environment.pth"
+
+RUN mkdir -p /opt/relax/mok-sources && \
+    timeout 600 git clone https://github.com/BestJuly/mixture-of-kittens.git /opt/relax/mok-sources/mixture-of-kittens && \
+    git -C /opt/relax/mok-sources/mixture-of-kittens checkout "$MOK_COMMIT" && \
+    timeout 600 git -C /opt/relax/mok-sources/mixture-of-kittens submodule update --init --recursive && \
+    git -C /opt/relax/mok-sources/mixture-of-kittens/third_party/ThunderKittens apply --check ../../patches/thunderkittens-mxfp8-mn-major.patch && \
+    git -C /opt/relax/mok-sources/mixture-of-kittens/third_party/ThunderKittens apply ../../patches/thunderkittens-mxfp8-mn-major.patch
+COPY docker/patches/mok-routed-only-intermediate128.patch /tmp/mok-routed-only-intermediate128.patch
+RUN git -C /opt/relax/mok-sources/mixture-of-kittens apply --check /tmp/mok-routed-only-intermediate128.patch && \
+    git -C /opt/relax/mok-sources/mixture-of-kittens apply /tmp/mok-routed-only-intermediate128.patch && \
+    env -u PIP_CONSTRAINT CUDA_VISIBLE_DEVICES='' CUDA_PATH=/usr/local/cuda \
+      MOK_ARCH=SM103 MOK_NVCC=/usr/local/cuda/bin/nvcc \
+      PATH="/opt/relax/mok-env/bin:/usr/local/cuda/bin:$PATH" \
+      timeout 4800 /opt/relax/mok-env/bin/python -m pip install \
+      --no-deps --no-build-isolation --timeout 30 --retries 2 /opt/relax/mok-sources/mixture-of-kittens && \
+    CUDA_VISIBLE_DEVICES='' /opt/relax/mok-env/bin/python -c 'import torch, mok; assert torch.__version__ == "2.13.0+cu130"'
+
+# Preserve the base image's MCore/Bridge patches. The named base lacks the MTP CP fix.
+COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /tmp/fully-reshardable-checkpoint-padding.patch
+COPY docker/patch/megatron/mtp-cp-normalization.patch /tmp/mtp-cp-normalization.patch
+COPY docker/patch/latest/mok-bf16-shared-output-gate.patch /tmp/mok-bf16-shared-output-gate.patch
+COPY docker/patch/latest/mok-tp-sp-native-shared.patch /tmp/mok-tp-sp-native-shared.patch
+RUN cp -a /root/Megatron-LM /opt/relax/mok-sources/Megatron-LM && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply --check /tmp/fully-reshardable-checkpoint-padding.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply /tmp/fully-reshardable-checkpoint-padding.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply --check /tmp/mtp-cp-normalization.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply /tmp/mtp-cp-normalization.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply --check /tmp/mok-bf16-shared-output-gate.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply /tmp/mok-bf16-shared-output-gate.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply --check /tmp/mok-tp-sp-native-shared.patch && \
+    git -C /opt/relax/mok-sources/Megatron-LM apply /tmp/mok-tp-sp-native-shared.patch
+
+# No default PATH/PYTHONPATH change: opt in for a compatible training recipe.
+ENV MOK_MCORE=/opt/relax/mok-sources/Megatron-LM \
+    MOK_PYTHON=/opt/relax/mok-env/bin/python \
+    MOK_SITE=/opt/relax/mok-env/lib/python3.12/site-packages
